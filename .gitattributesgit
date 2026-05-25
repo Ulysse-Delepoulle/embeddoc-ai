@@ -1,0 +1,1 @@
+*.html linguist-documentation=true add .gitattributesgit commit -m adjust language detectiongit push

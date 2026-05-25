@@ -1,0 +1,134 @@
+Step 1 — Foundation: PostgreSQL + pgvector + Embeddings
+
+  What problem are we solving?  A PDF is just text. To search it semantically ("find me anything about clock
+  configuration") rather than by keyword, we need to convert text into vectors  — arrays of numbers that encode meaning. Two chunks with similar meaning will   have vectors close together in space. pgvector is a PostgreSQL extension
+  that stores those vectors and can find the nearest ones to a query.
+
+  Key concepts covered:
+  - Why vectors? Because keyword search breaks on synonyms and paraphrasing —
+  "GPIO speed" and "output drive strength" mean the same thing, but share no
+  words
+  - Why PostgreSQL over FAISS/Chroma? Persistent, ACID-compliant, survives
+  restarts — in-memory stores lose all data when the server stops
+  - Why BAAI/bge-small-en-v1.5? Strong on English technical text, ~130 MB, runs   entirely on CPU, normalized output simplifies cosine distance math
+  - GPU auto-detection — torch.cuda.is_available() → mps → cpu fallback, so the   same code benefits from hardware automatically
+
+  ---
+  Step 2 — Ingestion: Parse → Chunk → Embed → Store
+
+  Key concepts covered:
+  - Why we chunk — embedding models have a token window limit (~512 tokens);
+  searching a 4000-page doc as one blob is also useless — you need the specific   paragraph, not the whole book
+  - Why overlap (200 chars) — the boundary between two chunks might cut through   a sentence; overlap means the context on both sides of any cut is preserved
+  in at least one chunk. Same idea as a sliding window in signal processing
+  - Why pdfplumber over PyMuPDF — pdfplumber extracts tables as structured
+  rows; PyMuPDF returns garbled whitespace-separated text for tables. Register
+  maps and pin tables survive as proper markdown
+  - Why we keep page numbers as metadata — citations. The page number travels
+  with every chunk so when Claude uses it, we know exactly where it came from
+  - Why batch add_documents — one DB roundtrip instead of N, essential for
+  large documents
+
+  ---
+  Step 3 — Retrieval: MMR + Score Threshold
+
+  What is retrieval?
+  You have thousands of chunks in pgvector. When a user asks "what is the
+  operating voltage of this chip?", you need to find the most relevant chunks
+  before sending anything to Claude. That's retrieval: question → embed the
+  question → vector search → top chunks with metadata.
+
+  Key concepts covered:
+  - Cosine distance vs similarity — pgvector MMR returns distances (lower =
+  more similar). A critical direction: the threshold must drop chunks with
+  distance above 0.70 (too far), not below. Inverting this silently discards
+  all relevant chunks
+  - Why MMR over plain top-k — a 4800-page reference manual will dominate all
+  result slots on almost any query. MMR (Maximal Marginal Relevance) fetches 20   candidates then greedily picks 4 that maximise relevance and diversity —
+  prevents one large doc from crowding out a 33-page guide
+  - Document filter — {"document_name": {"$in": [...]}} metadata filter passed
+  to the vector search; lets the user target one specific document per query
+  - Low confidence flag — if all chunks score above the distance threshold
+  (nothing close enough), skip Claude entirely and return a fixed message.
+  Calling the LLM with irrelevant context produces confident-sounding
+  hallucinations
+
+  ---
+  Step 4 — Generation: Claude + RAG
+
+  What is Claude's role?
+  Retrieval gives us the most relevant chunks. But raw chunks are not an answer   — they're fragments of text. Claude's job is to read those fragments and
+  write a coherent, cited answer. This pattern is RAG — Retrieval Augmented
+  Generation: retrieval finds the evidence, generation writes the answer from
+  that evidence.
+
+  Key concepts covered:
+  - System prompt sets the rules — "answer strictly from the provided context,
+  always cite document name and page number, say so clearly if the context is
+  insufficient." The constraint is what prevents hallucination
+  - Context goes before the question — Claude reads top to bottom; putting the
+  evidence first means it's fresh when the question arrives
+  - Conversation history window — last 4 exchanges (8 messages) sent as
+  HumanMessage/AIMessage pairs before the current question. Only bare questions   are stored in history, not the retrieved context (which changes per query).
+  Window cleared on "New chat"
+  - Why 4 turns? Earlier turns contain stale retrieved context and grow token
+  cost linearly with no quality benefit
+
+  ---
+  Step 5 — API: FastAPI
+
+  What is FastAPI's job?
+  The pipeline only works by running Python scripts manually. FastAPI turns it
+  into a web service — something any frontend, mobile app, or tool can talk to
+  over HTTP.
+
+  Endpoints:
+  - POST /ingest — accepts a PDF upload, saves it, spawns background ingestion,   returns job_id immediately
+  - POST /ask — accepts question + optional doc filter + conversation history,
+  returns Claude's answer + sources
+  - GET /status/{job_id} — live progress polling (chunks done, ETA, status)
+  - GET /docs — lists all ingested documents with display names
+  - DELETE /ingest — removes chunks from pgvector, deletes the file, removes
+  the DB record
+
+  Key concepts covered:
+  - Pydantic models — define the shape of request data; FastAPI validates
+  automatically and rejects malformed requests before your code runs
+  - UploadFile — FastAPI's way of receiving binary files; must be saved to disk   before processing
+  - lifespan context manager — yield divides startup (before) from shutdown
+  (after); init_db() runs once on startup to create tables if they don't exist
+  - Server-side display name persistence — embeddoc_documents table stores
+  filename → display_name; filename is the single internal key everywhere
+  (immutable), display name is purely cosmetic
+
+  ---
+  Step 6 — Frontend + Advanced Pipeline
+
+  Background ingestion:
+  Why threading.Thread instead of FastAPI's BackgroundTasks — BackgroundTasks
+  runs after the response but still inside the async event loop. Embedding is
+  CPU-bound and would block it. A threading.Thread(daemon=True) runs truly in
+  parallel. daemon=True means it dies automatically if the server stops.
+
+  The ingestion flow:
+  1. POST /ingest — saves file, returns job_id immediately
+  2. Background thread: Phase 1 parses + chunks (fast, ~1-2s even for large
+  docs), sets chunks_total; Phase 2 embeds in batches of 32, updating
+  chunks_done after each batch
+  3. Frontend polls GET /status/{job_id} every 2 seconds — ETA recalculated
+  live from actual rate: remaining = (total - done) / (done / elapsed)
+
+  Two-stage retrieval — MMR + cross-encoder reranker:
+  - Bi-encoders (the embedding model) embed query and chunk independently —
+  fast but approximate. Used for the initial vector search
+  - Cross-encoders (ms-marco-MiniLM-L-6-v2, ~85 MB) read query and chunk
+  jointly — far more precise. After MMR returns 4 candidates, the cross-encoder   scores each pair and reorders them. The most relevant chunk ends up first in   Claude's context, where it receives the most attention. First query is
+  slightly slower while the model loads; cached after that
+
+  Hallucination guardrail — three layers:
+  1. Distance threshold (0.70) — chunks too far from the query are dropped
+  before Claude sees anything
+  2. System prompt constraint — Claude is instructed to answer only from
+  provided context
+  3. Source citations — every answer includes document name and page number;
+  hallucinated content cannot be cited, so errors are immediately verifiable
